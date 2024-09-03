@@ -6,11 +6,12 @@
 //#include <bcm_host.h>qesd
 #define BLOCK_SIZE 4096
 #define GPIO_BASE 0xfe200000//0x7C200000
-#define UART_MINI_BASE 0x7e215000 // may be different
+#define UART_MINI_BASE 0xfe215000 // may be different
 #define UART0_BASE  0x7e201000
 //note to kaz [index] <- i * word.len (i*4)
 volatile unsigned *gpio;
 volatile unsigned *uart;
+char *uart_mem;
 
 void output_GPIO(int pin) // gpfsel - 0x00 to 0x14 offset (by 4's) // ren, fen, !! implement!
 {
@@ -50,31 +51,70 @@ void write_GPIO(int pin, int value)
 
 // mini UART implementation
 int mini_baud(int rate){ // output Baudrate set
-  //AUX_ENABLES -> mini uart enable
-  uart[0x04] |= 0x1; // aux_enables (mini uart)
-  uart[0x4c] |= 0x1; // 8 bit mode ; gpt said 0x3.. try that later
-  uart[0x60] |= 0x0; // 0x5 reciever enable, rtr flow ctrl enable
+  
+   // 8 bit mode ; gpt said 0x3.. try that later
+  uart[0x60/4] &= ~(0xFF);
+  uart[0x60/4] |= 0x1; // 0x1 reciever enable
   int baud_reg =  (250000000 / (rate * 8)) - 1; // check
-  uart[0x68] = baud_reg;
+
+  uart[0x4c/4] |= 0x80; //dlab set (start baud reg modification)
+  uart[0x68/4] = 0xCB6; // 415~~ almost 9600 baud
+  uart[0x4c/4] |= 0x1; // moved here just to give time to update baud
+  uart[0x4c/4] &= ~(0x80); //dlab clear uart ready
+
+  //uart[0x68/4] = baud_reg;
+  /*
+  printf("bits @ uart_baud: %x\n", uart[0x68/4]);
+  printf("bits @ ctrl_reg: %x\n", uart[0x60/4]);
+  printf("dlab !!!!!!!! ----> %d \n", uart[0x4c/4] & (1 << 7));
+  printf("status (3/2 over run, 3/1 ready) %x\n", (uart[0x54/4] & 0x3));
+  */
   __sync_synchronize(); //flush mem barrier
+
+
+  //DLAB access (bit 7) AUX_MU_LCR_REG (also set bit 0 to 1 for 8-bit mode)
+  //If set the first two Mini UART registers give access to the Baudrate register. During operation this bit must be cleared.
 }
 
 void mini_uart_enable(){
-  //fsel15-14 -> 17:15 and 14:12
-  // gpio 15 -> rxd0 (low pull @ alt0)
-  uart[0x4c] |= (1<<7); //set dlab to 0
 
-  gpio[0x04] &= ~(0b111 << 15);
-  gpio[0x04] |= (0b100 << 15);
-  gpio[0x04] &= ~(0b111 << 12);
-  gpio[0x04] |= (0b100 << 12);
-
-
+  gpio[0x04/4] &= ~(0x3FFFFFFF);
+  gpio[0x04/4] |= (0x12000); // set fsel1 to alt5 (MINI UART -> RXD1 & TXD1)
+  __sync_synchronize();
+  uart[0x04/4] &= ~0x7;
+  uart[0x04/4] |= 0b001;// enable mini_uart
+  __sync_synchronize();
+  printf("bits @ gpio fsel: %x\n", gpio[0x04/4]);
+  printf("bits @ uart en: %x\n", uart[0x04/4]);
 }
 
 int uart_read_byte(){
   //while((uart[0x54] & 0x1) != 1); // no data? no bitches!
-  return (uart[0x40] & 0xFF); //AUX_MU_IO_REG
+  if(uart[0x4c/4] & (1 << 7)){
+    return -1;
+  }
+  
+  printf("STATS: \n");
+  printf("# of bits in RXD1: %x\n", (uart[0x64/4] & (0xF << 16))); //16 to 19
+  printf("idle?: %d\n", (uart[0x64/4] & (1 << 2))==1); //b2 reciever disabled checker
+  printf("clear?: %d\n", (uart[0x64/4] & (1 << 1)) == 1); //b1
+  printf("symb avail?: %d\n", (uart[0x64/4] & (1)) == 1); //b0
+  
+  return (uart[0x40/4] & 0xFF); //AUX_MU_IO_REG
+}
+void loopback_test(){
+  //mucntl bit 1 trnasmitter enable
+  uart[0x60/4] |= 0b10;
+  char test_data[] = "Hello, UART!";
+  int length = sizeof(test_data) - 1;
+  char received_data[length];
+  for(int i = 0; i < length; i++){
+    uart[0x40/4] |= (0xFF << 7);
+    usleep(208);
+    //while (!(uart[0x64 / 4] & 0x1)); // stat reg
+    received_data[i] = uart[0x40 / 4] & 0xFF;
+  }
+  printf("!!!! %c\n", test_data);
 }
 
 void write_buffer(char *buff, int size) {
@@ -82,7 +122,7 @@ void write_buffer(char *buff, int size) {
     FILE *file = fopen("uart_output.txt", "a");
     if (file) {
         //fwrite(buff, 1, size, file);
-        putc(buff[0], file);
+        //putc(buff[0], file);
         fclose(file);
     }
 }
@@ -100,16 +140,6 @@ void uart_read_output(char *buff, int size){
     }
   }
 }
-
-//AUX_MU_STAT_REG -> recieving FIFO information reg
-//AUX_MU_LSR_REG
-struct Stats{ 
-  short int fifo_len;// = (0xF << 15) & uart[OFFSET];
-  short int fifo_idle;// = 0x4 & uart[OFFSET];
-  short int fifo_space;// = 0x2 & uart[OFFSET];
-  short int fifo_ovrn;// = 0x10 & uart[OFFSET];
-} uart_states; // lookup how structs work lol
-
 //write in 2 banks 32 bits (57 total) bit inputs (limit bank 2 to 32:57)
 void write_GPIO_masked(unsigned int bank0, unsigned int bank1)
 {
@@ -151,7 +181,6 @@ int port_asn(volatile unsigned** BASE_){
 }
 int main()
 {
-
   /*
   if (port_asn(&gpio) != 0) {
         return -1; // Handle error
@@ -165,9 +194,13 @@ int main()
     perror("open");
     return -1;
   }
+  if ((unsigned long)uart_mem % 4096)
+     uart_mem += 4096 - ((unsigned long)uart_mem % 4096);
+  printf("Adjusted UART base address: %08x\n", &uart_mem);
   //sets the starting (virtualy mapped) address for GPIOs
   gpio = (volatile unsigned*) mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, GPIO_BASE);
-  uart = (volatile unsigned*) mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, UART_MINI_BASE);
+  uart = (volatile unsigned*) mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, mem_fd, UART_MINI_BASE);
+  
   if(gpio == MAP_FAILED)
   {
     perror("mmap");
@@ -177,6 +210,7 @@ int main()
   if(uart == MAP_FAILED)
   {
     perror("mmap");
+    printf("failed uart map\n");
     close(mem_fd);
     return -1;
   }
@@ -185,34 +219,40 @@ int main()
     printf("Mapped addr (gpios): %08x \n", gpio[i]);
   }
   //printf("\n");
-  for(int i = 0; i < 8; i++){
-    printf("Mapped addr (uart): %08x \n", uart[i]);
+  for(int i = 0; i < 0x64/4; i++){
+    printf("Mapped addr (uart): %08x @ %x\n", uart[i], &uart[i]);
   }
   //fflush(stdout);
   output_GPIO(5);
   input_GPIO(6, 1); //maybe add #define PUP 1
   
-  mini_uart_enable();
-  printf("here");
-  mini_baud(230400);
+  mini_uart_enable(); 
+  printf("here"); 
+  mini_baud(9600);
   printf("here2"); 
-  //uart_read_output(buffer);
-  uart_read_output(buffer, sizeof(buffer) - 1);  
-  //fflush(stdout);
-  //uart_read_byte();
-  //printf("UART Output: %s\n", buffer);
-  //fflush(stdout);
+  loopback_test();
+  //uart[0x04] = 10;
   while(1)
   {
     printf("looping.. %d \n", read_GPIO(6));
     fflush(stdout);
+    char c = uart_read_byte();
+    printf("byte: %x\n",c);
     
+    c = uart_read_byte();
+    printf("byte: %x\n",c);
     //if(read_GPIO(6))
     //  printf("success!");
     write_GPIO(5,1);
     sleep(1);
     write_GPIO(5,0);
     sleep(1);
+    
+    printf("AUX_MU_LCR_REG: %x\n", uart[0x4C/4]);  // Check LCR_REG value
+    printf("AUX_MU_LSR_REG: %x\n", uart[0x54/4]);  // Check LSR_REG value (Line Status Register)
+    printf("AUX_MU_IO_REG: %x\n", uart[0x40/4]);  // Check IO_REG value (Input/Output Register)
+    
+
   }
   munmap((void*) gpio, 4096);
   munmap((void*) uart, 4096);
