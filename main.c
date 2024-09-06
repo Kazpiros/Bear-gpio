@@ -5,27 +5,42 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include "kBCM2711.h"
+#include "auxIRQ.h"
 
 void read_out_peripherals();
 
 int main()
 {
-  
+  /* setups */
   if (setup_peripherals() != 0) {
         return -1; // Handle error
   }
-  read_out_peripherals();
-
-  char buffer[1024]; // so i dont have to read
+  read_out_peripherals(); 
+  mini_uart_enable(); 
+  mini_baud(9600);
 
   output_GPIO(5);
   input_GPIO(6, 1); //maybe add #define PUP 1
   
-  mini_uart_enable(); 
-  printf("here"); 
-  mini_baud(9600);
-  printf("here2"); 
-
+  //char buffer[1024]; // so i dont have to read
+  // the
+  /* end of setups*/
+  char *buffer = malloc(10 * sizeof(LidarFrame));
+  
+  LidarFrame *Frame;
+  //uart_read_stream(buffer, &Frame);
+  //parse_buffer(buffer);
+  free(buffer);
+  //free(Frame);
+  while(1){
+    while((IRQ[0x200/4] & ~(1 << 29))){
+    printf("%c\n", reverse_byte(uart_read_byte()));
+    usleep(10000);
+    printf("%c\n",(uart_read_byte()));
+    uart[0x48/4] |= 0xF;
+    usleep(10);
+    }
+  }
   while(1)
   {
     printf("looping.. %d \n", read_GPIO(6));
